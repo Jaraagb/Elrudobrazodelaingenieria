@@ -56,6 +56,11 @@ os> queues
 os> run 8
 os> status
 ```
+# Lo anterior funciona de la siguiente manera 
+nombre: p1
+prioridad: 3
+CPU total: 6 ticks
+memoria: 100
 
 ## Ejemplo de prueba por consola (no interactivo)
 
