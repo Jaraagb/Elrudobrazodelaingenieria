@@ -1,52 +1,66 @@
-# MiniOS Simulado - Gestión de Accesos
+# MiniOS Simulado - Gestión de Recursos y Planificación
 
-Este repositorio incluye una implementación en Python de un **mini sistema operativo simulado** enfocado en:
+Este proyecto implementa un **mini sistema operativo educativo** en Python para simular:
 
-- Login / logout de usuarios.
-- Gestión de permisos de acceso.
-- Administración básica de archivos y carpetas.
-- Control de acceso por ACL (lectura, escritura, ejecución).
+- Gestión de procesos (creación, estados y finalización).
+- Planificación con **prioridades dinámicas + Round Robin**.
+- Mecanismo de **aging** para evitar inanición.
+- Gestión de recursos:
+  - CPU (por el planificador)
+  - Memoria RAM simulada
+  - E/S con cola **FIFO**
+- Interacción por línea de comandos (CLI).
 
 ## Requisitos
 
 - Python 3.10+
 
-## Ejecución
+## Ejecutar
 
 ```bash
 python access_management_os.py
 ```
 
-## Usuario inicial
+## Parámetros por defecto de la simulación
 
-Se crea automáticamente un usuario administrador:
+- Quantum Round Robin: `2`
+- Aging threshold: `4` ticks
+- Memoria total: `512`
+- Dispositivos de E/S: `1`
 
-- Usuario: `admin`
-- Contraseña: `admin123`
+## Estados de proceso
 
-## Comandos principales
+- `Nuevo`
+- `Listo`
+- `Ejecutando`
+- `Bloqueado`
+- `Terminado`
 
-- `register <usuario> <password>`
-- `login <usuario> <password>`
-- `logout`
-- `whoami`
-- `pwd`
-- `mkdir <ruta>`
-- `touch <ruta>`
-- `ls [ruta]`
-- `cd <ruta>`
-- `write <archivo> <texto...>`
-- `cat <archivo>`
-- `grant <ruta> <usuario> <rwx>`
+## Comandos CLI
+
+- `create <nombre> <prioridad> <cpu_total> <memoria> [io_freq io_duracion]`
+- `tick`
+- `run <n>`
+- `status`
+- `queues`
 - `help`
 - `exit`
 
 ## Ejemplo rápido
 
 ```text
-guest:/$ login admin admin123
-admin:/$ mkdir proyectos
-admin:/$ touch proyectos/notas.txt
-admin:/$ write proyectos/notas.txt hola_mundo
-admin:/$ cat proyectos/notas.txt
+os> create editor 3 6 100
+os> create backup 3 6 100
+os> create reporte 5 4 150 2 2
+os> queues
+os> run 8
+os> status
+```
+
+## Ejemplo de prueba por consola (no interactivo)
+
+Puedes ejecutar un flujo automatizado con `printf`:
+
+```bash
+printf "create p1 3 6 100\ncreate p2 3 6 100\ncreate p3 5 4 120 2 2\nqueues\nrun 10\nstatus\nexit\n" | python access_management_os.py
 ```

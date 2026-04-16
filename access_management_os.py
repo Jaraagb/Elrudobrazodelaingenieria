@@ -1,311 +1,334 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set
-import hashlib
+from typing import Deque, Dict, List, Optional
 
 
-class Permission(str, Enum):
-    READ = "r"
-    WRITE = "w"
-    EXECUTE = "x"
-
-
-@dataclass
-class User:
-    username: str
-    password_hash: str
-    is_admin: bool = False
+class ProcessState(str, Enum):
+    NEW = "Nuevo"
+    READY = "Listo"
+    RUNNING = "Ejecutando"
+    BLOCKED = "Bloqueado"
+    TERMINATED = "Terminado"
 
 
 @dataclass
-class Session:
-    user: User
-    cwd: str = "/"
-
-
-@dataclass
-class FSNode:
+class Process:
+    pid: int
     name: str
-    owner: str
-    is_dir: bool
-    content: str = ""
-    children: Dict[str, "FSNode"] = field(default_factory=dict)
-    acl: Dict[str, Set[Permission]] = field(default_factory=dict)
+    priority: int
+    total_cpu_time: int
+    memory_required: int
+    io_frequency: int = 0
+    io_duration: int = 0
+    state: ProcessState = ProcessState.NEW
+    cpu_used: int = 0
+    waiting_ticks: int = 0
+    blocked_ticks_left: int = 0
+    io_counter: int = 0
 
-    def __post_init__(self) -> None:
-        # Propietario con control completo por defecto
-        self.acl.setdefault(self.owner, {Permission.READ, Permission.WRITE, Permission.EXECUTE})
-
-
-class AuthError(Exception):
-    pass
-
-
-class AccessError(Exception):
-    pass
-
-
-class NotFoundError(Exception):
-    pass
+    def short(self) -> str:
+        return (
+            f"PID={self.pid} {self.name} | prio={self.priority} | "
+            f"cpu={self.cpu_used}/{self.total_cpu_time} | mem={self.memory_required} | {self.state.value}"
+        )
 
 
-class AuthManager:
-    def __init__(self) -> None:
-        self.users: Dict[str, User] = {}
-        self._seed_admin()
-
-    def _seed_admin(self) -> None:
-        self.register("admin", "admin123", is_admin=True)
-
-    @staticmethod
-    def _hash_password(password: str) -> str:
-        return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-    def register(self, username: str, password: str, is_admin: bool = False) -> User:
-        if username in self.users:
-            raise AuthError("El usuario ya existe")
-        user = User(username=username, password_hash=self._hash_password(password), is_admin=is_admin)
-        self.users[username] = user
-        return user
-
-    def login(self, username: str, password: str) -> Session:
-        user = self.users.get(username)
-        if not user:
-            raise AuthError("Usuario no encontrado")
-        if user.password_hash != self._hash_password(password):
-            raise AuthError("Credenciales inválidas")
-        return Session(user=user)
+@dataclass
+class IORequest:
+    pid: int
+    duration: int
 
 
-class FileSystem:
-    def __init__(self) -> None:
-        self.root = FSNode(name="/", owner="admin", is_dir=True)
+class ResourceManager:
+    def __init__(self, total_memory: int = 1024, io_devices: int = 1) -> None:
+        self.total_memory = total_memory
+        self.used_memory = 0
+        self.io_devices = io_devices
+        self.io_busy = 0
+        self.memory_allocations: Dict[int, int] = {}
+        self.io_wait_queue: Deque[IORequest] = deque()
 
-    def _normalize(self, cwd: str, path: str) -> str:
-        if path.startswith("/"):
-            absolute = path
-        else:
-            absolute = f"{cwd.rstrip('/')}/{path}" if cwd != "/" else f"/{path}"
+    @property
+    def free_memory(self) -> int:
+        return self.total_memory - self.used_memory
 
-        parts: List[str] = []
-        for part in absolute.split("/"):
-            if part in ("", "."):
-                continue
-            if part == "..":
-                if parts:
-                    parts.pop()
-                continue
-            parts.append(part)
-        return "/" + "/".join(parts)
-
-    def _split(self, path: str) -> List[str]:
-        return [p for p in path.split("/") if p]
-
-    def get_node(self, path: str) -> FSNode:
-        if path == "/":
-            return self.root
-        node = self.root
-        for part in self._split(path):
-            if not node.is_dir or part not in node.children:
-                raise NotFoundError(f"Ruta no encontrada: {path}")
-            node = node.children[part]
-        return node
-
-    def _has_perm(self, node: FSNode, username: str, permission: Permission, is_admin: bool) -> bool:
-        if is_admin:
+    def allocate_memory(self, pid: int, amount: int) -> bool:
+        if amount <= self.free_memory:
+            self.used_memory += amount
+            self.memory_allocations[pid] = amount
             return True
-        return permission in node.acl.get(username, set())
+        return False
 
-    def _assert_perm(self, node: FSNode, username: str, permission: Permission, is_admin: bool) -> None:
-        if not self._has_perm(node, username, permission, is_admin):
-            raise AccessError(f"Permiso denegado: falta '{permission.value}' en {node.name}")
+    def release_memory(self, pid: int) -> None:
+        amount = self.memory_allocations.pop(pid, 0)
+        self.used_memory = max(0, self.used_memory - amount)
 
-    def mkdir(self, cwd: str, path: str, username: str, is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        parent_path = "/" + "/".join(self._split(abs_path)[:-1]) if len(self._split(abs_path)) > 1 else "/"
-        dirname = self._split(abs_path)[-1]
-        parent = self.get_node(parent_path)
-        self._assert_perm(parent, username, Permission.WRITE, is_admin)
-        if dirname in parent.children:
-            raise AccessError("Ya existe un archivo o carpeta con ese nombre")
-        parent.children[dirname] = FSNode(name=dirname, owner=username, is_dir=True)
-        return abs_path
+    def request_io(self, pid: int, duration: int) -> bool:
+        if self.io_busy < self.io_devices:
+            self.io_busy += 1
+            return True
+        self.io_wait_queue.append(IORequest(pid=pid, duration=duration))
+        return False
 
-    def touch(self, cwd: str, path: str, username: str, is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        parent_path = "/" + "/".join(self._split(abs_path)[:-1]) if len(self._split(abs_path)) > 1 else "/"
-        filename = self._split(abs_path)[-1]
-        parent = self.get_node(parent_path)
-        self._assert_perm(parent, username, Permission.WRITE, is_admin)
-        if filename not in parent.children:
-            parent.children[filename] = FSNode(name=filename, owner=username, is_dir=False)
-        return abs_path
+    def release_io_slot(self) -> Optional[IORequest]:
+        self.io_busy = max(0, self.io_busy - 1)
+        if self.io_wait_queue and self.io_busy < self.io_devices:
+            self.io_busy += 1
+            return self.io_wait_queue.popleft()
+        return None
 
-    def ls(self, cwd: str, path: str, username: str, is_admin: bool) -> List[str]:
-        abs_path = self._normalize(cwd, path)
-        node = self.get_node(abs_path)
-        self._assert_perm(node, username, Permission.READ, is_admin)
-        if node.is_dir:
-            return sorted(node.children.keys())
-        return [node.name]
 
-    def cd(self, cwd: str, path: str, username: str, is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        node = self.get_node(abs_path)
-        if not node.is_dir:
-            raise AccessError("No es una carpeta")
-        self._assert_perm(node, username, Permission.EXECUTE, is_admin)
-        return abs_path
+class ProcessScheduler:
+    def __init__(self, quantum: int = 2, aging_threshold: int = 4, max_priority: int = 10) -> None:
+        self.quantum = quantum
+        self.aging_threshold = aging_threshold
+        self.max_priority = max_priority
+        self._queues: Dict[int, Deque[int]] = {}
 
-    def write_file(self, cwd: str, path: str, content: str, username: str, is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        node = self.get_node(abs_path)
-        if node.is_dir:
-            raise AccessError("No se puede escribir en una carpeta")
-        self._assert_perm(node, username, Permission.WRITE, is_admin)
-        node.content = content
-        return abs_path
+    def enqueue(self, pid: int, priority: int) -> None:
+        self._queues.setdefault(priority, deque()).append(pid)
 
-    def read_file(self, cwd: str, path: str, username: str, is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        node = self.get_node(abs_path)
-        if node.is_dir:
-            raise AccessError("No se puede leer una carpeta como archivo")
-        self._assert_perm(node, username, Permission.READ, is_admin)
-        return node.content
+    def remove(self, pid: int) -> None:
+        for q in self._queues.values():
+            try:
+                q.remove(pid)
+                return
+            except ValueError:
+                pass
 
-    def grant(self, cwd: str, path: str, owner_user: str, target_user: str, perms: Set[Permission], is_admin: bool) -> str:
-        abs_path = self._normalize(cwd, path)
-        node = self.get_node(abs_path)
-        if not is_admin and node.owner != owner_user:
-            raise AccessError("Solo el propietario o admin puede conceder permisos")
-        node.acl.setdefault(target_user, set()).update(perms)
-        return abs_path
+    def pop_next(self) -> Optional[int]:
+        for prio in sorted(self._queues.keys(), reverse=True):
+            q = self._queues[prio]
+            if q:
+                return q.popleft()
+        return None
+
+    def snapshot(self) -> Dict[int, List[int]]:
+        return {p: list(q) for p, q in sorted(self._queues.items(), reverse=True) if q}
 
 
 class MiniOS:
-    def __init__(self) -> None:
-        self.auth = AuthManager()
-        self.fs = FileSystem()
-        self.session: Optional[Session] = None
+    def __init__(self, quantum: int = 2, aging_threshold: int = 4, total_memory: int = 1024, io_devices: int = 1) -> None:
+        self.scheduler = ProcessScheduler(quantum=quantum, aging_threshold=aging_threshold)
+        self.resources = ResourceManager(total_memory=total_memory, io_devices=io_devices)
+        self.processes: Dict[int, Process] = {}
+        self.next_pid = 1
+        self.clock = 0
 
-    def _require_login(self) -> Session:
-        if not self.session:
-            raise AuthError("Debes iniciar sesión primero")
-        return self.session
+    def create_process(
+        self,
+        name: str,
+        priority: int,
+        total_cpu_time: int,
+        memory_required: int,
+        io_frequency: int = 0,
+        io_duration: int = 0,
+    ) -> Process:
+        if priority < 1:
+            raise ValueError("La prioridad debe ser >= 1")
+        if total_cpu_time < 1:
+            raise ValueError("El tiempo total de CPU debe ser >= 1")
+        if memory_required < 1:
+            raise ValueError("La memoria debe ser >= 1")
 
-    def handle(self, raw: str) -> str:
-        tokens = raw.strip().split()
-        if not tokens:
-            return ""
-        cmd, *args = tokens
+        pid = self.next_pid
+        self.next_pid += 1
+        proc = Process(
+            pid=pid,
+            name=name,
+            priority=priority,
+            total_cpu_time=total_cpu_time,
+            memory_required=memory_required,
+            io_frequency=io_frequency,
+            io_duration=io_duration,
+        )
 
-        if cmd == "register":
-            if len(args) < 2:
-                return "Uso: register <usuario> <password>"
-            self.auth.register(args[0], args[1])
-            return f"Usuario '{args[0]}' creado"
+        if self.resources.allocate_memory(pid, memory_required):
+            proc.state = ProcessState.READY
+            self.scheduler.enqueue(pid, proc.priority)
+        else:
+            proc.state = ProcessState.BLOCKED
+            proc.blocked_ticks_left = -1  # espera indefinida por memoria
 
-        if cmd == "login":
-            if len(args) < 2:
-                return "Uso: login <usuario> <password>"
-            self.session = self.auth.login(args[0], args[1])
-            return f"Sesión iniciada como {args[0]}"
+        self.processes[pid] = proc
+        return proc
 
-        if cmd == "logout":
-            self.session = None
-            return "Sesión cerrada"
+    def _apply_aging(self) -> None:
+        for proc in self.processes.values():
+            if proc.state == ProcessState.READY:
+                proc.waiting_ticks += 1
+                if proc.waiting_ticks >= self.scheduler.aging_threshold:
+                    old_priority = proc.priority
+                    proc.priority = min(proc.priority + 1, self.scheduler.max_priority)
+                    proc.waiting_ticks = 0
+                    if proc.priority != old_priority:
+                        self.scheduler.remove(proc.pid)
+                        self.scheduler.enqueue(proc.pid, proc.priority)
 
-        try:
-            session = self._require_login()
-            username = session.user.username
-            is_admin = session.user.is_admin
+    def _try_unblock_memory_waiters(self) -> None:
+        for proc in self.processes.values():
+            if proc.state == ProcessState.BLOCKED and proc.blocked_ticks_left == -1:
+                if self.resources.allocate_memory(proc.pid, proc.memory_required):
+                    proc.state = ProcessState.READY
+                    self.scheduler.enqueue(proc.pid, proc.priority)
 
-            if cmd == "pwd":
-                return session.cwd
+    def _progress_blocked(self) -> None:
+        finished_io: List[int] = []
+        for proc in self.processes.values():
+            if proc.state == ProcessState.BLOCKED and proc.blocked_ticks_left > 0:
+                proc.blocked_ticks_left -= 1
+                if proc.blocked_ticks_left == 0:
+                    finished_io.append(proc.pid)
 
-            if cmd == "whoami":
-                return f"{username}{' (admin)' if is_admin else ''}"
+        for pid in finished_io:
+            proc = self.processes[pid]
+            proc.state = ProcessState.READY
+            self.scheduler.enqueue(pid, proc.priority)
+            next_io_waiter = self.resources.release_io_slot()
+            if next_io_waiter:
+                queued_proc = self.processes[next_io_waiter.pid]
+                queued_proc.state = ProcessState.BLOCKED
+                queued_proc.blocked_ticks_left = next_io_waiter.duration
 
-            if cmd == "mkdir":
-                path = args[0]
-                created = self.fs.mkdir(session.cwd, path, username, is_admin)
-                return f"Carpeta creada: {created}"
+    def tick(self) -> str:
+        self.clock += 1
+        self._progress_blocked()
+        self._try_unblock_memory_waiters()
+        self._apply_aging()
 
-            if cmd == "touch":
-                path = args[0]
-                created = self.fs.touch(session.cwd, path, username, is_admin)
-                return f"Archivo listo: {created}"
+        pid = self.scheduler.pop_next()
+        if pid is None:
+            return f"[t={self.clock}] CPU inactiva"
 
-            if cmd == "ls":
-                path = args[0] if args else "."
-                items = self.fs.ls(session.cwd, path, username, is_admin)
-                return "\n".join(items) if items else "(vacío)"
+        proc = self.processes[pid]
+        proc.state = ProcessState.RUNNING
+        proc.waiting_ticks = 0
 
-            if cmd == "cd":
-                path = args[0]
-                new_path = self.fs.cd(session.cwd, path, username, is_admin)
-                session.cwd = new_path
-                return f"Directorio actual: {new_path}"
+        used_in_slice = 0
+        io_triggered = False
 
-            if cmd == "write":
-                if len(args) < 2:
-                    return "Uso: write <archivo> <texto...>"
-                path = args[0]
-                content = " ".join(args[1:])
-                written = self.fs.write_file(session.cwd, path, content, username, is_admin)
-                return f"Contenido actualizado en: {written}"
+        while used_in_slice < self.scheduler.quantum:
+            proc.cpu_used += 1
+            proc.io_counter += 1
+            used_in_slice += 1
 
-            if cmd == "cat":
-                path = args[0]
-                return self.fs.read_file(session.cwd, path, username, is_admin)
+            if proc.io_frequency > 0 and proc.io_duration > 0 and proc.io_counter >= proc.io_frequency:
+                proc.io_counter = 0
+                io_triggered = True
+                break
 
-            if cmd == "grant":
-                if len(args) < 3:
-                    return "Uso: grant <ruta> <usuario> <permisos (rwx)>"
-                path, target_user, perm_str = args[0], args[1], args[2]
-                perms = {Permission(ch) for ch in perm_str if ch in {"r", "w", "x"}}
-                if not perms:
-                    return "Permisos inválidos. Usa combinaciones de r, w, x"
-                self.fs.grant(session.cwd, path, username, target_user, perms, is_admin)
-                return f"Permisos {perm_str} concedidos sobre {path} a {target_user}"
+            if proc.cpu_used >= proc.total_cpu_time:
+                break
 
-            if cmd == "help":
+        if proc.cpu_used >= proc.total_cpu_time:
+            proc.state = ProcessState.TERMINATED
+            self.resources.release_memory(proc.pid)
+            return f"[t={self.clock}] Ejecutado PID {proc.pid} ({proc.name}) -> TERMINADO"
+
+        if io_triggered:
+            if self.resources.request_io(proc.pid, proc.io_duration):
+                proc.state = ProcessState.BLOCKED
+                proc.blocked_ticks_left = proc.io_duration
                 return (
-                    "Comandos:\n"
-                    "  register <u> <p>\n"
-                    "  login <u> <p> | logout\n"
-                    "  whoami | pwd\n"
-                    "  mkdir <ruta> | touch <ruta>\n"
-                    "  ls [ruta] | cd <ruta>\n"
-                    "  write <archivo> <texto> | cat <archivo>\n"
-                    "  grant <ruta> <usuario> <rwx>\n"
-                    "  help | exit"
+                    f"[t={self.clock}] Ejecutado PID {proc.pid} ({proc.name}) -> BLOQUEADO "
+                    f"por E/S {proc.io_duration} ticks"
                 )
 
-            if cmd == "exit":
-                raise SystemExit
+            proc.state = ProcessState.BLOCKED
+            proc.blocked_ticks_left = 0  # esperando turno de dispositivo
+            return f"[t={self.clock}] Ejecutado PID {proc.pid} ({proc.name}) -> en cola FIFO de E/S"
 
-            return "Comando no reconocido. Usa 'help'."
+        proc.state = ProcessState.READY
+        self.scheduler.enqueue(proc.pid, proc.priority)
+        return (
+            f"[t={self.clock}] Ejecutado PID {proc.pid} ({proc.name}) quantum={used_in_slice} "
+            f"-> vuelve a LISTO"
+        )
 
-        except (AuthError, AccessError, NotFoundError, IndexError, ValueError) as exc:
-            return f"Error: {exc}"
+    def run(self, ticks: int) -> List[str]:
+        if ticks < 1:
+            raise ValueError("Ticks debe ser >= 1")
+        return [self.tick() for _ in range(ticks)]
+
+    def system_status(self) -> str:
+        lines = [
+            f"Reloj: {self.clock}",
+            f"Memoria: {self.resources.used_memory}/{self.resources.total_memory} (libre={self.resources.free_memory})",
+            f"E/S ocupados: {self.resources.io_busy}/{self.resources.io_devices}",
+            f"Cola E/S FIFO: {[req.pid for req in self.resources.io_wait_queue] or 'vacía'}",
+            "Procesos:",
+        ]
+        for pid in sorted(self.processes):
+            lines.append(f"  - {self.processes[pid].short()}")
+        return "\n".join(lines)
+
+    def ready_queues(self) -> str:
+        snap = self.scheduler.snapshot()
+        if not snap:
+            return "Colas de listos vacías"
+        return "\n".join([f"Prioridad {prio}: {pids}" for prio, pids in snap.items()])
+
+
+HELP_TEXT = (
+    "Comandos:\n"
+    "  create <nombre> <prioridad> <cpu_total> <memoria> [io_freq io_duracion]\n"
+    "  tick                     # ejecuta 1 ciclo de planificación\n"
+    "  run <n>                  # ejecuta n ticks\n"
+    "  status                   # muestra estado global del sistema\n"
+    "  queues                   # muestra colas READY por prioridad\n"
+    "  help\n"
+    "  exit"
+)
 
 
 def run_cli() -> None:
-    system = MiniOS()
-    print("MiniOS - Gestión de Accesos (escribe 'help' para ayuda)")
+    os_sim = MiniOS(quantum=2, aging_threshold=4, total_memory=512, io_devices=1)
+    print("MiniOS Simulado - Planificador Prioridades Dinámicas + Round Robin")
+    print("Escribe 'help' para ver los comandos.")
+
     while True:
         try:
-            prompt_user = system.session.user.username if system.session else "guest"
-            prompt_cwd = system.session.cwd if system.session else "/"
-            raw = input(f"{prompt_user}:{prompt_cwd}$ ")
-            out = system.handle(raw)
-            if out:
-                print(out)
-        except (KeyboardInterrupt, EOFError, SystemExit):
+            raw = input("os> ").strip()
+            if not raw:
+                continue
+            tokens = raw.split()
+            cmd, *args = tokens
+
+            if cmd == "help":
+                print(HELP_TEXT)
+            elif cmd == "create":
+                if len(args) not in {4, 6}:
+                    print("Uso: create <nombre> <prioridad> <cpu_total> <memoria> [io_freq io_duracion]")
+                    continue
+                name = args[0]
+                priority = int(args[1])
+                cpu_total = int(args[2])
+                memory = int(args[3])
+                io_freq = int(args[4]) if len(args) == 6 else 0
+                io_duration = int(args[5]) if len(args) == 6 else 0
+                proc = os_sim.create_process(name, priority, cpu_total, memory, io_freq, io_duration)
+                print(f"Proceso creado: {proc.short()}")
+            elif cmd == "tick":
+                print(os_sim.tick())
+            elif cmd == "run":
+                n = int(args[0])
+                for line in os_sim.run(n):
+                    print(line)
+            elif cmd == "status":
+                print(os_sim.system_status())
+            elif cmd == "queues":
+                print(os_sim.ready_queues())
+            elif cmd == "exit":
+                print("Saliendo...")
+                break
+            else:
+                print("Comando no reconocido. Usa 'help'.")
+        except (ValueError, IndexError) as exc:
+            print(f"Error: {exc}")
+        except (KeyboardInterrupt, EOFError):
             print("\nSaliendo...")
             break
 
